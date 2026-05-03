@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	goexec "os/exec"
 	"strconv"
@@ -29,13 +30,26 @@ func isHostKeyError(stderr string) bool {
 // OpenSSH is a rig.Connection implementation that uses the system openssh client "ssh" to connect to remote hosts.
 // The connection is multiplexec over a control master, so that subsequent connections don't need to re-authenticate.
 type OpenSSH struct {
-	Address             string         `yaml:"address" validate:"required"`
-	User                *string        `yaml:"user"`
-	Port                *int           `yaml:"port"`
-	KeyPath             *string        `yaml:"keyPath,omitempty"`
-	ConfigPath          *string        `yaml:"configPath,omitempty"`
-	Options             OpenSSHOptions `yaml:"options,omitempty"`
-	DisableMultiplexing bool           `yaml:"disableMultiplexing,omitempty"`
+	// Address of the remote host
+	Address string `yaml:"address" json:"address" validate:"required" jsonschema:"required,format=hostname,description=Address of the remote host"`
+
+	// Optional SSH user
+	User *string `yaml:"user,omitempty" json:"user,omitempty" jsonschema:"description=Optional SSH user"`
+
+	// Optional SSH port
+	Port *int `yaml:"port,omitempty" json:"port,omitempty" jsonschema:"minimum=1,maximum=65535,description=Optional SSH port"`
+
+	// Path to SSH private key
+	KeyPath *string `yaml:"keyPath,omitempty" json:"keyPath,omitempty" jsonschema:"description=Path to SSH private key"`
+
+	// Path to SSH config file
+	ConfigPath *string `yaml:"configPath,omitempty" json:"configPath,omitempty" jsonschema:"description=Path to SSH config file"`
+
+	// Additional SSH options as key-value pairs, such as StrictHostKeyChecking: false
+	Options OpenSSHOptions `yaml:"options,omitempty" json:"options,omitempty" jsonschema:"description=Additional SSH options as key-value pairs, such as StrictHostKeyChecking: false"`
+
+	// Disable SSH connection multiplexing
+	DisableMultiplexing bool `yaml:"disableMultiplexing,omitempty" json:"disableMultiplexing,omitempty" jsonschema:"default=false,description=Disable SSH connection multiplexing"`
 
 	isConnected  bool
 	controlMutex sync.Mutex
@@ -43,10 +57,6 @@ type OpenSSH struct {
 	isWindows *bool
 
 	name string
-}
-
-func boolPtr(b bool) *bool {
-	return &b
 }
 
 // Protocol returns the protocol name
@@ -66,7 +76,7 @@ func (c *OpenSSH) IsWindows() bool {
 		return *c.isWindows
 	}
 
-	c.isWindows = boolPtr(c.Exec("cmd.exe /c exit 0") == nil)
+	c.isWindows = new(c.Exec("cmd.exe /c exit 0") == nil)
 	log.Debugf("%s: host is windows: %t", c, *c.isWindows)
 
 	return *c.isWindows
@@ -78,9 +88,7 @@ type OpenSSHOptions map[string]any
 // Copy returns a copy of the options
 func (o OpenSSHOptions) Copy() OpenSSHOptions {
 	dup := make(OpenSSHOptions, len(o))
-	for k, v := range o {
-		dup[k] = v
-	}
+	maps.Copy(dup, o)
 	return dup
 }
 
@@ -109,9 +117,9 @@ func (o OpenSSHOptions) ToArgs() []string {
 	for k, v := range o {
 		if b, ok := v.(bool); ok {
 			if b {
-				args = append(args, "-o", fmt.Sprintf("%s=yes", k))
+				args = append(args, "-o", k+"=yes")
 			} else {
-				args = append(args, "-o", fmt.Sprintf("%s=no", k))
+				args = append(args, "-o", k+"=no")
 			}
 			continue
 		}
@@ -212,11 +220,11 @@ func (c *OpenSSH) Connect() error {
 	opts.Set("ControlPersist", 600)
 	opts.Set("TCPKeepalive", true)
 
-	args := []string{"-N", "-f"}
+	args := []string{"-N", "-f"} //nolint:prealloc
 	args = append(args, opts.ToArgs()...)
 	args = append(args, c.args()...)
 
-	cmd := goexec.Command("ssh", args...)
+	cmd := goexec.Command("ssh", args...) //nolint:noctx
 	var errBuf bytes.Buffer
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = io.MultiWriter(os.Stderr, &errBuf)
@@ -252,12 +260,12 @@ func (c *OpenSSH) closeControl() error {
 		return ErrControlPathNotSet
 	}
 
-	args := []string{"-O", "exit", "-S", controlPath}
+	args := []string{"-O", "exit", "-S", controlPath} //nolint:prealloc
 	args = append(args, c.args()...)
 	args = append(args, c.userhost())
 
 	log.Debugf("%s: closing ssh multiplexing control master", c)
-	cmd := goexec.Command("ssh", args...)
+	cmd := goexec.Command("ssh", args...) //nolint:noctx
 	err := cmd.Run()
 	if err != nil {
 		return fmt.Errorf("failed to close control master: %w", err)
@@ -283,7 +291,7 @@ func (c *OpenSSH) Exec(cmdStr string, opts ...exec.Option) error { //nolint:cycl
 	args = append(args, "-o", "BatchMode=yes")
 	args = append(args, c.args()...)
 	args = append(args, "--", command)
-	cmd := goexec.Command("ssh", args...)
+	cmd := goexec.Command("ssh", args...) //nolint:noctx
 
 	if execOpts.Stdin != "" {
 		execOpts.LogStdin(c.String())
@@ -306,10 +314,7 @@ func (c *OpenSSH) Exec(cmdStr string, opts ...exec.Option) error { //nolint:cycl
 	}
 
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-
+	wg.Go(func() {
 		if execOpts.Writer == nil {
 			outputScanner := bufio.NewScanner(stdout)
 
@@ -324,11 +329,8 @@ func (c *OpenSSH) Exec(cmdStr string, opts ...exec.Option) error { //nolint:cycl
 				execOpts.LogErrorf("%s: failed to stream stdout: %v", c, err)
 			}
 		}
-	}()
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-
+	})
+	wg.Go(func() {
 		outputScanner := bufio.NewScanner(stderr)
 
 		for outputScanner.Scan() {
@@ -337,7 +339,7 @@ func (c *OpenSSH) Exec(cmdStr string, opts ...exec.Option) error { //nolint:cycl
 		if err := outputScanner.Err(); err != nil {
 			execOpts.LogErrorf("%s: failed to scan stderr: %v", c, err)
 		}
-	}()
+	})
 
 	wg.Wait()
 	err = cmd.Wait()
@@ -362,7 +364,7 @@ func (c *OpenSSH) ExecStreams(cmdStr string, stdin io.ReadCloser, stdout, stderr
 	args = append(args, "-o", "BatchMode=yes")
 	args = append(args, c.args()...)
 	args = append(args, "--", command)
-	cmd := goexec.Command("ssh", args...)
+	cmd := goexec.Command("ssh", args...) //nolint:noctx
 
 	cmd.Stdin = stdin
 	cmd.Stdout = stdout
@@ -394,7 +396,7 @@ func (c *OpenSSH) String() string {
 		return c.name
 	}
 
-	c.name = fmt.Sprintf("[OpenSSH] %s", c.userhost())
+	c.name = "[OpenSSH] " + c.userhost()
 	if c.Port != nil {
 		c.name = fmt.Sprintf("%s:%d", c.name, *c.Port)
 	}
